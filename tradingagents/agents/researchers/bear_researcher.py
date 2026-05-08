@@ -1,3 +1,4 @@
+from tradingagents.agents.utils.agent_utils import llm_retry
 
 
 def create_bear_researcher(llm):
@@ -33,7 +34,7 @@ Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the stock.
 """
 
-        response = llm.invoke(prompt)
+        response = llm_retry(llm.invoke, prompt)
 
         argument = f"Bear Analyst: {response.content}"
 

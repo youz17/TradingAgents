@@ -23,6 +23,8 @@ from typing import Any, Callable, Optional, TypeVar
 
 from pydantic import BaseModel
 
+from tradingagents.agents.utils.agent_utils import llm_retry
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -61,7 +63,7 @@ def invoke_structured_or_freetext(
     """
     if structured_llm is not None:
         try:
-            result = structured_llm.invoke(prompt)
+            result = llm_retry(structured_llm.invoke, prompt)
             return render(result)
         except Exception as exc:
             logger.warning(
@@ -69,5 +71,5 @@ def invoke_structured_or_freetext(
                 agent_name, exc,
             )
 
-    response = plain_llm.invoke(prompt)
+    response = llm_retry(plain_llm.invoke, prompt)
     return response.content

@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_insider_transactions,
     get_language_instruction,
+    llm_retry,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -54,7 +55,7 @@ def create_fundamentals_analyst(llm):
 
         chain = prompt | llm.bind_tools(tools)
 
-        result = chain.invoke(state["messages"])
+        result = llm_retry(chain.invoke, state["messages"])
 
         report = ""
 

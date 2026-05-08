@@ -1,4 +1,9 @@
+import logging
+import time
+
 from langchain_core.messages import HumanMessage, RemoveMessage
+
+logger = logging.getLogger(__name__)
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import (
@@ -41,6 +46,34 @@ def build_instrument_context(ticker: str) -> str:
         "Use this exact ticker in every tool call, report, and recommendation, "
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
     )
+
+def llm_retry(fn, *args, max_retries: int = 5, base_delay: float = 4.0, **kwargs):
+    """Call *fn* with exponential backoff on transient LLM API errors (429, 5xx).
+
+    Re-raises the last exception if all retries are exhausted so the caller
+    still sees the original error.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            transient = any(k in exc_str for k in (
+                "rate limit", "rate_limit", "too many requests",
+                "429", "500", "502", "503", "504",
+                "service_unavailable", "service unavailable",
+                "overloaded", "server_error", "internal server error",
+                "service is too busy",
+            ))
+            if not transient or attempt >= max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "LLM API transient error (attempt %d/%d), retrying in %.0fs: %s",
+                attempt + 1, max_retries, delay, exc,
+            )
+            time.sleep(delay)
+
 
 def create_msg_delete():
     def delete_messages(state):
