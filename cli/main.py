@@ -722,8 +722,17 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
 
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
-    return save_path / "complete_report.md"
+    md_path = save_path / "complete_report.md"
+    md_path.write_text(header + "\n\n".join(sections), encoding="utf-8")
+
+    # Generate HTML version with scrollable navigation
+    try:
+        from cli.html_report import generate_html_report
+        generate_html_report(md_path)
+    except Exception:
+        pass  # HTML is a nice-to-have; don't block on failure
+
+    return md_path
 
 
 def display_complete_report(final_state):
@@ -1014,6 +1023,10 @@ def run_analysis(checkpoint: bool = False):
     message_buffer.add_tool_call = save_tool_call_decorator(message_buffer, "add_tool_call")
     message_buffer.update_report_section = save_report_section_decorator(message_buffer, "update_report_section")
 
+    # Start live HTML report (user can open in browser for scrollable view)
+    from cli.live_report import LiveReportWriter
+    live_writer = LiveReportWriter(results_dir, selections["ticker"])
+
     # Now start the display layout
     layout = create_layout()
 
@@ -1030,6 +1043,12 @@ def run_analysis(checkpoint: bool = False):
             "System",
             f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
         )
+        message_buffer.add_message(
+            "System",
+            f"Live report: {live_writer.html_path} (open in browser for scrollable view)",
+        )
+        live_writer.sync_from_buffer(message_buffer)
+        live_writer.write()
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
         # Update agent status to in_progress for the first analyst
@@ -1150,6 +1169,10 @@ def run_analysis(checkpoint: bool = False):
             # Update the display
             update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
+            # Update live HTML report
+            live_writer.sync_from_buffer(message_buffer)
+            live_writer.write()
+
             trace.append(chunk)
 
         # Get final state and decision
@@ -1171,6 +1194,10 @@ def run_analysis(checkpoint: bool = False):
 
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
+        # Finalize live HTML report (stops auto-refresh)
+        live_writer.sync_from_buffer(message_buffer)
+        live_writer.finish()
+
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
 
@@ -1187,7 +1214,10 @@ def run_analysis(checkpoint: bool = False):
         try:
             report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
-            console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+            console.print(f"  [dim]Markdown:[/dim] {report_file.name}")
+            html_file = report_file.with_suffix(".html")
+            if html_file.exists():
+                console.print(f"  [dim]HTML (open in browser):[/dim] {html_file.name}")
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
 
