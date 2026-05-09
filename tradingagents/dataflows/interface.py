@@ -1,4 +1,12 @@
+import logging
+import time
+from collections import Counter
 from typing import Annotated
+
+logger = logging.getLogger(__name__)
+
+_call_stats: Counter = Counter()
+_call_timings: dict[str, list[float]] = {}
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -169,6 +177,17 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    call_key = f"{method}"
+    _call_stats[call_key] += 1
+    call_num = _call_stats[call_key]
+    args_summary = ", ".join(str(a)[:60] for a in args)
+    logger.info(
+        "[ROUTE] #%d %s(%s) — vendors: %s",
+        call_num, method, args_summary, " → ".join(fallback_vendors),
+    )
+    t0 = time.perf_counter()
+
+    last_exc = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -176,9 +195,51 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
+        vt0 = time.perf_counter()
         try:
-            return impl_func(*args, **kwargs)
-        except (AlphaVantageRateLimitError, AkShareError):
-            continue  # Transient vendor errors trigger fallback
+            result = impl_func(*args, **kwargs)
+            elapsed = time.perf_counter() - t0
+            v_elapsed = time.perf_counter() - vt0
+            _call_timings.setdefault(call_key, []).append(elapsed)
+            result_len = len(result) if isinstance(result, str) else 0
+            logger.info(
+                "[ROUTE] #%d %s ✓ vendor=%s  %.2fs (vendor %.2fs)  result=%d chars  total_calls=%d",
+                call_num, method, vendor, elapsed, v_elapsed, result_len, call_num,
+            )
+            return result
+        except Exception as exc:
+            v_elapsed = time.perf_counter() - vt0
+            last_exc = exc
+            logger.warning(
+                "[ROUTE] #%d %s ✗ vendor=%s failed in %.2fs: %s",
+                call_num, method, vendor, v_elapsed, exc,
+            )
+            continue
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    elapsed = time.perf_counter() - t0
+    logger.error(
+        "[ROUTE] #%d %s ALL VENDORS FAILED in %.2fs: %s", call_num, method, elapsed, last_exc
+    )
+    return (
+        f"[DATA UNAVAILABLE] All data vendors failed for '{method}'. "
+        f"Last error: {last_exc}. "
+        f"Please proceed with the analysis using whatever data is available."
+    )
+
+
+def get_call_stats_summary() -> str:
+    """Return a human-readable summary of all route_to_vendor calls and timings."""
+    lines = ["=== Data Vendor Call Statistics ==="]
+    for method, count in sorted(_call_stats.items()):
+        timings = _call_timings.get(method, [])
+        if timings:
+            avg_t = sum(timings) / len(timings)
+            max_t = max(timings)
+            total_t = sum(timings)
+            lines.append(
+                f"  {method}: {count} calls, {len(timings)} ok, "
+                f"avg={avg_t:.2f}s, max={max_t:.2f}s, total={total_t:.1f}s"
+            )
+        else:
+            lines.append(f"  {method}: {count} calls, 0 ok")
+    return "\n".join(lines)

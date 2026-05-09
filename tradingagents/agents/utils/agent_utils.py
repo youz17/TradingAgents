@@ -47,15 +47,34 @@ def build_instrument_context(ticker: str) -> str:
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
     )
 
+_llm_call_count = 0
+_llm_total_time = 0.0
+
+
 def llm_retry(fn, *args, max_retries: int = 5, base_delay: float = 4.0, **kwargs):
     """Call *fn* with exponential backoff on transient LLM API errors (429, 5xx).
 
     Re-raises the last exception if all retries are exhausted so the caller
     still sees the original error.
     """
+    global _llm_call_count, _llm_total_time
+    _llm_call_count += 1
+    call_num = _llm_call_count
+    fn_name = getattr(fn, "__qualname__", getattr(fn, "__name__", str(fn)))
+    logger.info("[LLM] #%d calling %s", call_num, fn_name)
+    t0 = time.perf_counter()
+
     for attempt in range(max_retries + 1):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            elapsed = time.perf_counter() - t0
+            _llm_total_time += elapsed
+            content_len = len(getattr(result, "content", "")) if hasattr(result, "content") else 0
+            logger.info(
+                "[LLM] #%d %s ✓ %.2fs (attempt %d) response=%d chars  cumulative: %d calls, %.1fs total",
+                call_num, fn_name, elapsed, attempt + 1, content_len, _llm_call_count, _llm_total_time,
+            )
+            return result
         except Exception as exc:
             exc_str = str(exc).lower()
             transient = any(k in exc_str for k in (
@@ -66,11 +85,13 @@ def llm_retry(fn, *args, max_retries: int = 5, base_delay: float = 4.0, **kwargs
                 "service is too busy",
             ))
             if not transient or attempt >= max_retries:
+                elapsed = time.perf_counter() - t0
+                logger.error("[LLM] #%d %s ✗ FAILED in %.2fs after %d attempts: %s", call_num, fn_name, elapsed, attempt + 1, exc)
                 raise
             delay = base_delay * (2 ** attempt)
             logger.warning(
-                "LLM API transient error (attempt %d/%d), retrying in %.0fs: %s",
-                attempt + 1, max_retries, delay, exc,
+                "[LLM] #%d %s transient error (attempt %d/%d), retrying in %.0fs: %s",
+                call_num, fn_name, attempt + 1, max_retries, delay, exc,
             )
             time.sleep(delay)
 

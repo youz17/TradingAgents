@@ -1,3 +1,6 @@
+import logging
+import re
+import time
 from typing import Annotated
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -5,6 +8,22 @@ import pandas as pd
 import yfinance as yf
 import os
 from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
+
+logger = logging.getLogger(__name__)
+
+_A_SHARE_RE = re.compile(r"^\d{6}$")
+
+
+def _normalize_yf_symbol(symbol: str) -> str:
+    """Append .SS/.SZ suffix for bare A-share codes so yfinance can resolve them.
+
+    Shanghai: codes starting with 6
+    Shenzhen: codes starting with 0, 3
+    """
+    s = symbol.strip()
+    if _A_SHARE_RE.match(s):
+        return f"{s}.SS" if s.startswith("6") else f"{s}.SZ"
+    return s
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -15,13 +34,15 @@ def get_YFin_data_online(
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
 
-    # Create ticker object
-    ticker = yf.Ticker(symbol.upper())
+    symbol = _normalize_yf_symbol(symbol)
+    logger.info("[YFINANCE] get_YFin_data_online(%s, %s, %s)", symbol, start_date, end_date)
+    t0 = time.perf_counter()
 
-    # Fetch historical data for the specified date range
+    ticker = yf.Ticker(symbol.upper())
     data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
 
-    # Check if data is empty
+    logger.info("[YFINANCE] get_YFin_data_online OK: %s, %d rows in %.2fs", symbol, len(data), time.perf_counter() - t0)
+
     if data.empty:
         return (
             f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
@@ -251,7 +272,7 @@ def get_fundamentals(
 ):
     """Get company fundamentals overview from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_normalize_yf_symbol(ticker).upper())
         info = yf_retry(lambda: ticker_obj.info)
 
         if not info:
@@ -309,7 +330,7 @@ def get_balance_sheet(
 ):
     """Get balance sheet data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_normalize_yf_symbol(ticker).upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
@@ -341,7 +362,7 @@ def get_cashflow(
 ):
     """Get cash flow data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_normalize_yf_symbol(ticker).upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
@@ -373,7 +394,7 @@ def get_income_statement(
 ):
     """Get income statement data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_normalize_yf_symbol(ticker).upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
@@ -403,7 +424,7 @@ def get_insider_transactions(
 ):
     """Get insider transactions data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_normalize_yf_symbol(ticker).upper())
         data = yf_retry(lambda: ticker_obj.insider_transactions)
         
         if data is None or data.empty:

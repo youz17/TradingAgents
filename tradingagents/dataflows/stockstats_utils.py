@@ -1,3 +1,4 @@
+import re
 import time
 import logging
 
@@ -10,6 +11,16 @@ import os
 from .config import get_config
 from .utils import safe_ticker_component
 
+_A_SHARE_RE = re.compile(r"^\d{6}$")
+
+
+def _normalize_yf_symbol(symbol: str) -> str:
+    """Append .SS/.SZ for bare A-share codes."""
+    s = symbol.strip()
+    if _A_SHARE_RE.match(s):
+        return f"{s}.SS" if s.startswith("6") else f"{s}.SZ"
+    return s
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,15 +31,21 @@ def yf_retry(func, max_retries=3, base_delay=2.0):
     retry them internally. This wrapper adds retry logic specifically
     for rate limits. Other exceptions propagate immediately.
     """
+    t0 = time.perf_counter()
     for attempt in range(max_retries + 1):
         try:
-            return func()
+            result = func()
+            elapsed = time.perf_counter() - t0
+            if attempt > 0:
+                logger.info("[YFINANCE] yf_retry succeeded after %d retries in %.2fs", attempt, elapsed)
+            return result
         except YFRateLimitError:
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
-                logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
+                logger.warning("[YFINANCE] rate limited, retry %d/%d in %.0fs (elapsed %.1fs)", attempt + 1, max_retries, delay, time.perf_counter() - t0)
                 time.sleep(delay)
             else:
+                logger.error("[YFINANCE] rate limited, all %d retries exhausted in %.1fs", max_retries, time.perf_counter() - t0)
                 raise
 
 
@@ -52,8 +69,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     subsequent calls the cache is reused. Rows after curr_date are
     filtered out so backtests never see future prices.
     """
-    # Reject ticker values that would escape the cache directory when
-    # interpolated into the cache filename (e.g. ``../../tmp/x``).
+    symbol = _normalize_yf_symbol(symbol)
     safe_symbol = safe_ticker_component(symbol)
 
     config = get_config()
@@ -72,8 +88,11 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     )
 
     if os.path.exists(data_file):
+        logger.info("[YFINANCE] OHLCV cache HIT: %s", data_file)
         data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
     else:
+        logger.info("[YFINANCE] OHLCV cache MISS: %s, downloading...", symbol)
+        t0 = time.perf_counter()
         data = yf_retry(lambda: yf.download(
             symbol,
             start=start_str,
@@ -82,6 +101,8 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             progress=False,
             auto_adjust=True,
         ))
+        elapsed = time.perf_counter() - t0
+        logger.info("[YFINANCE] OHLCV download OK: %s, %d rows in %.2fs", symbol, len(data), elapsed)
         data = data.reset_index()
         data.to_csv(data_file, index=False, encoding="utf-8")
 

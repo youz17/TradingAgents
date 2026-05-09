@@ -1,9 +1,13 @@
+import logging
 import os
+import time
 import requests
 import pandas as pd
 import json
 from datetime import datetime
 from io import StringIO
+
+logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://www.alphavantage.co/query"
 
@@ -63,7 +67,11 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
     
+    logger.info("[ALPHAVANTAGE] API request: %s, symbol=%s", function_name, params.get("symbol", "N/A"))
+    t0 = time.perf_counter()
     response = requests.get(API_BASE_URL, params=api_params)
+    elapsed = time.perf_counter() - t0
+    logger.info("[ALPHAVANTAGE] API response: %s, status=%d, %.2fs, %d bytes", function_name, response.status_code, elapsed, len(response.text))
     response.raise_for_status()
 
     response_text = response.text
