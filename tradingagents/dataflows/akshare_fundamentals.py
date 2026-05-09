@@ -1,11 +1,26 @@
-"""AKShare-based company fundamentals, balance sheet, cashflow, and income statement."""
+"""AKShare-based company fundamentals, balance sheet, cashflow, and income statement.
 
+Primary data source: Sina Finance (``stock_financial_report_sina``).
+The previous East Money ``*_by_report_em`` APIs are broken upstream
+(page structure changed), so Sina is used as the reliable default.
+"""
+
+import logging
+import time
 from datetime import datetime
 from typing import Annotated
 
 import pandas as pd
 
-from .akshare_common import AkShareError, detect_market, normalize_symbol_cn
+from .akshare_common import AkShareError, akshare_retry, detect_market, normalize_symbol_cn
+
+logger = logging.getLogger(__name__)
+
+_SINA_REPORT_MAP = {
+    "balance_sheet": "资产负债表",
+    "income_statement": "利润表",
+    "cashflow": "现金流量表",
+}
 
 
 def _filter_by_date(df: pd.DataFrame, date_col: str, curr_date: str | None) -> pd.DataFrame:
@@ -13,19 +28,27 @@ def _filter_by_date(df: pd.DataFrame, date_col: str, curr_date: str | None) -> p
     if not curr_date or df.empty or date_col not in df.columns:
         return df
     cutoff = pd.Timestamp(curr_date)
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
     return df[df[date_col] <= cutoff]
+
+
+def _fetch_sina_report(symbol: str, report_type: str) -> pd.DataFrame:
+    """Fetch a financial report from Sina via AKShare.
+
+    ``report_type`` is one of the keys in ``_SINA_REPORT_MAP``.
+    """
+    import akshare as ak
+
+    sina_indicator = _SINA_REPORT_MAP[report_type]
+    df = akshare_retry(ak.stock_financial_report_sina, stock=symbol, symbol=sina_indicator)
+    return df
 
 
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Return key financial-analysis indicators for an A-share stock.
-
-    For non-CN symbols a friendly message is returned because AKShare
-    fundamentals are currently limited to the Chinese market.
-    """
+    """Return key financial-analysis indicators for an A-share stock."""
     import akshare as ak
 
     market = detect_market(ticker)
@@ -38,10 +61,14 @@ def get_fundamentals(
 
     symbol = normalize_symbol_cn(ticker)
 
+    logger.info("[AKSHARE] get_fundamentals(%s) calling stock_financial_analysis_indicator", ticker)
+    t0 = time.perf_counter()
     try:
-        df = ak.stock_financial_analysis_indicator(symbol=symbol, start_year="2020")
+        df = akshare_retry(ak.stock_financial_analysis_indicator, symbol=symbol, start_year="2020")
     except Exception as e:
+        logger.error("[AKSHARE] get_fundamentals FAILED for %s in %.2fs: %s", ticker, time.perf_counter() - t0, e)
         raise AkShareError(f"Failed to fetch fundamentals for {ticker}: {e}") from e
+    logger.info("[AKSHARE] get_fundamentals OK: %s, %d rows in %.2fs", ticker, len(df) if df is not None else 0, time.perf_counter() - t0)
 
     if df is None or df.empty:
         return f"No fundamentals data found for symbol '{ticker}'"
@@ -82,9 +109,7 @@ def get_balance_sheet(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Retrieve balance-sheet data via AKShare (East Money)."""
-    import akshare as ak
-
+    """Retrieve balance-sheet data via AKShare (Sina Finance)."""
     market = detect_market(ticker)
     if market != "cn":
         return (
@@ -94,24 +119,28 @@ def get_balance_sheet(
 
     symbol = normalize_symbol_cn(ticker)
 
+    logger.info("[AKSHARE] get_balance_sheet(%s) calling stock_financial_report_sina", ticker)
+    t0 = time.perf_counter()
     try:
-        df = ak.stock_balance_sheet_by_report_em(symbol=symbol)
+        df = _fetch_sina_report(symbol, "balance_sheet")
     except Exception as e:
+        logger.error("[AKSHARE] get_balance_sheet FAILED for %s in %.2fs: %s", ticker, time.perf_counter() - t0, e)
         raise AkShareError(f"Failed to fetch balance sheet for {ticker}: {e}") from e
+    logger.info("[AKSHARE] get_balance_sheet OK: %s, %d rows in %.2fs", ticker, len(df) if df is not None else 0, time.perf_counter() - t0)
 
     if df is None or df.empty:
         return f"No balance sheet data found for symbol '{ticker}'"
 
-    date_col = "REPORT_DATE" if "REPORT_DATE" in df.columns else df.columns[0]
+    date_col = "报告日" if "报告日" in df.columns else df.columns[0]
     df = _filter_by_date(df, date_col, curr_date)
 
     if df.empty:
         return f"No balance sheet data found for symbol '{ticker}' before {curr_date}"
 
-    csv_string = df.head(20).to_csv(index=False)
+    csv_string = df.head(8).to_csv(index=False)
 
     header = f"# Balance Sheet for {symbol} ({freq})\n"
-    header += f"# Data source: AKShare (East Money)\n"
+    header += f"# Data source: AKShare (Sina Finance)\n"
     header += f"# Retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
     return header + csv_string
@@ -122,9 +151,7 @@ def get_cashflow(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Retrieve cash-flow statement via AKShare (East Money)."""
-    import akshare as ak
-
+    """Retrieve cash-flow statement via AKShare (Sina Finance)."""
     market = detect_market(ticker)
     if market != "cn":
         return (
@@ -134,24 +161,28 @@ def get_cashflow(
 
     symbol = normalize_symbol_cn(ticker)
 
+    logger.info("[AKSHARE] get_cashflow(%s) calling stock_financial_report_sina", ticker)
+    t0 = time.perf_counter()
     try:
-        df = ak.stock_cash_flow_sheet_by_report_em(symbol=symbol)
+        df = _fetch_sina_report(symbol, "cashflow")
     except Exception as e:
+        logger.error("[AKSHARE] get_cashflow FAILED for %s in %.2fs: %s", ticker, time.perf_counter() - t0, e)
         raise AkShareError(f"Failed to fetch cash flow for {ticker}: {e}") from e
+    logger.info("[AKSHARE] get_cashflow OK: %s, %d rows in %.2fs", ticker, len(df) if df is not None else 0, time.perf_counter() - t0)
 
     if df is None or df.empty:
         return f"No cash flow data found for symbol '{ticker}'"
 
-    date_col = "REPORT_DATE" if "REPORT_DATE" in df.columns else df.columns[0]
+    date_col = "报告日" if "报告日" in df.columns else df.columns[0]
     df = _filter_by_date(df, date_col, curr_date)
 
     if df.empty:
         return f"No cash flow data found for symbol '{ticker}' before {curr_date}"
 
-    csv_string = df.head(20).to_csv(index=False)
+    csv_string = df.head(8).to_csv(index=False)
 
     header = f"# Cash Flow Statement for {symbol} ({freq})\n"
-    header += f"# Data source: AKShare (East Money)\n"
+    header += f"# Data source: AKShare (Sina Finance)\n"
     header += f"# Retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
     return header + csv_string
@@ -162,9 +193,7 @@ def get_income_statement(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Retrieve income statement via AKShare (East Money)."""
-    import akshare as ak
-
+    """Retrieve income statement via AKShare (Sina Finance)."""
     market = detect_market(ticker)
     if market != "cn":
         return (
@@ -174,24 +203,28 @@ def get_income_statement(
 
     symbol = normalize_symbol_cn(ticker)
 
+    logger.info("[AKSHARE] get_income_statement(%s) calling stock_financial_report_sina", ticker)
+    t0 = time.perf_counter()
     try:
-        df = ak.stock_profit_sheet_by_report_em(symbol=symbol)
+        df = _fetch_sina_report(symbol, "income_statement")
     except Exception as e:
+        logger.error("[AKSHARE] get_income_statement FAILED for %s in %.2fs: %s", ticker, time.perf_counter() - t0, e)
         raise AkShareError(f"Failed to fetch income statement for {ticker}: {e}") from e
+    logger.info("[AKSHARE] get_income_statement OK: %s, %d rows in %.2fs", ticker, len(df) if df is not None else 0, time.perf_counter() - t0)
 
     if df is None or df.empty:
         return f"No income statement data found for symbol '{ticker}'"
 
-    date_col = "REPORT_DATE" if "REPORT_DATE" in df.columns else df.columns[0]
+    date_col = "报告日" if "报告日" in df.columns else df.columns[0]
     df = _filter_by_date(df, date_col, curr_date)
 
     if df.empty:
         return f"No income statement data found for symbol '{ticker}' before {curr_date}"
 
-    csv_string = df.head(20).to_csv(index=False)
+    csv_string = df.head(8).to_csv(index=False)
 
     header = f"# Income Statement for {symbol} ({freq})\n"
-    header += f"# Data source: AKShare (East Money)\n"
+    header += f"# Data source: AKShare (Sina Finance)\n"
     header += f"# Retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
     return header + csv_string

@@ -1,12 +1,53 @@
 import re
 import logging
 import os
+import time as _time
+
 import pandas as pd
 
 from .config import get_config
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
+
+
+def akshare_retry(func, *args, max_retries: int = 3, base_delay: float = 2.0, **kwargs):
+    """Call *func* with retries on transient network / HTTP errors.
+
+    Uses exponential backoff: 2s, 4s, 8s.  Only retries on connection
+    errors and HTTP 5xx; everything else is re-raised immediately.
+    """
+    import requests
+    from http.client import RemoteDisconnected
+    from urllib3.exceptions import ProtocolError
+    _RETRYABLE = (
+        ConnectionError, TimeoutError, RemoteDisconnected, ProtocolError,
+        requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except _RETRYABLE as exc:
+            if attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "[AKSHARE] transient error, retry %d/%d in %.0fs: %s",
+                attempt, max_retries, delay, exc,
+            )
+            _time.sleep(delay)
+        except Exception as exc:
+            if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+                if exc.response.status_code >= 500 and attempt < max_retries:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "[AKSHARE] server %d, retry %d/%d in %.0fs",
+                        exc.response.status_code, attempt, max_retries, delay,
+                    )
+                    _time.sleep(delay)
+                    continue
+            raise
 
 # Market code prefixes used by East Money (AKShare's upstream source for US stocks)
 _US_MARKET_PREFIXES = {
@@ -47,6 +88,12 @@ def normalize_symbol_cn(symbol: str) -> str:
     return symbol.strip().zfill(6)
 
 
+def normalize_symbol_sina(symbol: str) -> str:
+    """Convert a 6-digit A-share code to the Sina format ``sh600519`` / ``sz002594``."""
+    code = normalize_symbol_cn(symbol)
+    return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+
 def normalize_symbol_us(symbol: str) -> str:
     """Convert a plain US ticker like ``AAPL`` to the AKShare format ``105.AAPL``.
 
@@ -81,6 +128,61 @@ def _cache_path(symbol: str, start: str, end: str) -> str:
     )
 
 
+def _fetch_cn_ohlcv(symbol: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Fetch A-share OHLCV with round-robin retry: Sina → East Money → Sina → ...
+
+    Sina (``stock_zh_a_daily``) is the default because it's more stable.
+    East Money (``stock_zh_a_hist``) is kept as a backup.  The loop tries
+    up to 4 attempts alternating between the two sources.
+    """
+    import akshare as ak
+
+    code = normalize_symbol_cn(symbol)
+    sina_sym = normalize_symbol_sina(symbol)
+
+    def _try_sina():
+        raw = ak.stock_zh_a_daily(symbol=sina_sym, adjust="qfq")
+        data = _normalise_cn_columns(raw)
+        if data.empty:
+            raise AkShareError("Sina returned empty data")
+        data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+        start_dt, end_dt = pd.Timestamp(start_str), pd.Timestamp(end_str)
+        return data[(data["Date"] >= start_dt) & (data["Date"] <= end_dt)]
+
+    def _try_eastmoney():
+        raw = ak.stock_zh_a_hist(
+            symbol=code, period="daily",
+            start_date=akshare_date(start_str),
+            end_date=akshare_date(end_str),
+            adjust="qfq",
+        )
+        data = _normalise_cn_columns(raw)
+        if data.empty:
+            raise AkShareError("East Money returned empty data")
+        return data
+
+    sources = [
+        ("Sina", _try_sina),
+        ("EastMoney", _try_eastmoney),
+        ("Sina", _try_sina),
+        ("EastMoney", _try_eastmoney),
+    ]
+
+    last_exc = None
+    for name, fetch_fn in sources:
+        try:
+            data = fetch_fn()
+            if not data.empty:
+                logger.info("[AKSHARE] CN OHLCV OK via %s for %s", name, symbol)
+                return data
+        except Exception as e:
+            last_exc = e
+            logger.warning("[AKSHARE] %s failed for %s: %s", name, symbol, e)
+            _time.sleep(2)
+
+    raise AkShareError(f"All CN OHLCV sources failed for {symbol}: {last_exc}")
+
+
 def load_ohlcv_akshare(symbol: str, curr_date: str) -> pd.DataFrame:
     """Download OHLCV from AKShare with local CSV cache (same semantics as the
     yfinance ``load_ohlcv``).  Returns a DataFrame with columns
@@ -104,21 +206,18 @@ def load_ohlcv_akshare(symbol: str, curr_date: str) -> pd.DataFrame:
     )
 
     if os.path.exists(data_file):
+        logger.info("[AKSHARE] OHLCV cache HIT: %s", data_file)
         data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
     else:
         market = detect_market(symbol)
+        logger.info("[AKSHARE] OHLCV cache MISS: %s market=%s, fetching...", symbol, market)
+        t0 = _time.perf_counter()
         try:
             if market == "cn":
-                raw = ak.stock_zh_a_hist(
-                    symbol=normalize_symbol_cn(symbol),
-                    period="daily",
-                    start_date=akshare_date(start_str),
-                    end_date=akshare_date(end_str),
-                    adjust="qfq",
-                )
-                data = _normalise_cn_columns(raw)
+                data = _fetch_cn_ohlcv(symbol, start_str, end_str)
             elif market == "hk":
-                raw = ak.stock_hk_hist(
+                raw = akshare_retry(
+                    ak.stock_hk_hist,
                     symbol=normalize_symbol_hk(symbol),
                     period="daily",
                     start_date=akshare_date(start_str),
@@ -127,7 +226,8 @@ def load_ohlcv_akshare(symbol: str, curr_date: str) -> pd.DataFrame:
                 )
                 data = _normalise_cn_columns(raw)
             else:
-                raw = ak.stock_us_hist(
+                raw = akshare_retry(
+                    ak.stock_us_hist,
                     symbol=normalize_symbol_us(symbol),
                     period="daily",
                     start_date=akshare_date(start_str),
@@ -136,8 +236,12 @@ def load_ohlcv_akshare(symbol: str, curr_date: str) -> pd.DataFrame:
                 )
                 data = _normalise_cn_columns(raw)
         except Exception as e:
+            elapsed = _time.perf_counter() - t0
+            logger.error("[AKSHARE] OHLCV fetch FAILED for %s in %.2fs: %s", symbol, elapsed, e)
             raise AkShareError(f"AKShare data fetch failed for {symbol}: {e}") from e
 
+        elapsed = _time.perf_counter() - t0
+        logger.info("[AKSHARE] OHLCV fetch OK: %s, %d rows in %.2fs", symbol, len(data), elapsed)
         data.to_csv(data_file, index=False, encoding="utf-8")
 
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
@@ -167,10 +271,20 @@ _CN_COL_MAP = {
 }
 
 
+_SINA_COL_MAP = {
+    "date": "Date",
+    "open": "Open",
+    "close": "Close",
+    "high": "High",
+    "low": "Low",
+    "volume": "Volume",
+}
+
+
 def _normalise_cn_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename Chinese columns to English and keep a standard subset."""
+    """Rename Chinese or Sina lowercase columns to title-case English."""
     df = df.rename(columns=_CN_COL_MAP)
-    # If columns are already English (e.g. US stocks), just standardize
+    df = df.rename(columns=_SINA_COL_MAP)
     keep = ["Date", "Open", "High", "Low", "Close", "Volume"]
     present = [c for c in keep if c in df.columns]
     return df[present].copy()
