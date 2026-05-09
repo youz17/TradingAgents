@@ -680,19 +680,42 @@ def _fetch_company_name(ticker: str) -> str:
         return ""
 
 
-def _make_output_dir(ticker: str, base: Path | None = None) -> Path:
-    """Build ``./reports/{ticker}_{company_name}/`` under *base* (default: cwd).
+def _safe_folder_name(ticker: str, company: str) -> str:
+    """Build a sanitized folder/file stem like ``梅花生物_600873``."""
+    if company:
+        name = f"{company}_{ticker}"
+    else:
+        name = ticker
+    return name.replace("/", "_").replace("\\", "_").replace(":", "_")
 
-    Falls back to ``{ticker}`` if the company name cannot be resolved.
+
+def _make_output_dir(ticker: str, analysis_date: str | None = None,
+                     base: Path | None = None) -> Path:
+    """Build ``reports/details/<date>/<company>_<ticker>/``.
+
+    *analysis_date* defaults to today when omitted.
     """
     company = _fetch_company_name(ticker)
-    folder = f"{ticker}_{company}" if company else ticker
-    folder = folder.replace("/", "_").replace("\\", "_")
-    return (base or Path.cwd()) / "reports" / folder
+    folder = _safe_folder_name(ticker, company)
+    if analysis_date is None:
+        analysis_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    return (base or Path.cwd()) / "reports" / "details" / analysis_date / folder
 
 
-def save_report_to_disk(final_state, ticker: str, save_path: Path):
-    """Save complete analysis report to disk with organized subfolders."""
+def _report_htmls_dir(base: Path | None = None) -> Path:
+    """Return ``reports/report_htmls/``."""
+    return (base or Path.cwd()) / "reports" / "report_htmls"
+
+
+def save_report_to_disk(final_state, ticker: str, save_path: Path,
+                        analysis_date: str | None = None):
+    """Save complete analysis report to disk with organized subfolders.
+
+    Returns the path to the generated ``complete_report.md``.
+    A copy of the HTML report is placed under ``reports/report_htmls/``
+    with the naming convention ``<company>_<code>_<date>.html``.
+    """
+    import shutil
     save_path.mkdir(parents=True, exist_ok=True)
     sections = []
 
@@ -781,11 +804,23 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     md_path.write_text(header + "\n\n".join(sections), encoding="utf-8")
 
     # Generate HTML version with scrollable navigation
+    html_path = md_path.with_suffix(".html")
     try:
         from cli.html_report import generate_html_report
         generate_html_report(md_path)
     except Exception:
-        pass  # HTML is a nice-to-have; don't block on failure
+        pass
+
+    # Copy the HTML report to reports/report_htmls/<company>_<code>_<date>.html
+    if html_path.exists():
+        if analysis_date is None:
+            analysis_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        company = _fetch_company_name(ticker)
+        stem = _safe_folder_name(ticker, company)
+        dest_dir = _report_htmls_dir()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / f"{stem}_{analysis_date}.html"
+        shutil.copy2(html_path, dest_file)
 
     return md_path
 
@@ -1030,8 +1065,8 @@ def run_analysis(checkpoint: bool = False):
     # Track start time for elapsed display
     start_time = time.time()
 
-    # Create result directory under ./reports/{ticker}_{company}/
-    results_dir = _make_output_dir(selections["ticker"])
+    # Create result directory under ./reports/details/<date>/<company>_<ticker>/
+    results_dir = _make_output_dir(selections["ticker"], selections["analysis_date"])
     results_dir.mkdir(parents=True, exist_ok=True)
     report_dir = results_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1273,19 +1308,24 @@ def run_analysis(checkpoint: bool = False):
     # Prompt to save report
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
     if save_choice in ("Y", "YES", ""):
-        default_path = _make_output_dir(selections["ticker"])
+        default_path = _make_output_dir(selections["ticker"], selections["analysis_date"])
         save_path_str = typer.prompt(
             "Save path (press Enter for default)",
             default=str(default_path)
         ).strip()
         save_path = Path(save_path_str)
         try:
-            report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
+            report_file = save_report_to_disk(
+                final_state, selections["ticker"], save_path,
+                analysis_date=selections["analysis_date"],
+            )
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Markdown:[/dim] {report_file.name}")
             html_file = report_file.with_suffix(".html")
             if html_file.exists():
                 console.print(f"  [dim]HTML (open in browser):[/dim] {html_file.name}")
+            htmls_dir = _report_htmls_dir()
+            console.print(f"  [dim]Quick access:[/dim] {htmls_dir.resolve()}")
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
 
@@ -1353,8 +1393,8 @@ def _run_headless(
         callbacks=[stats_handler],
     )
 
-    # Result directories under ./reports/{ticker}_{company}/
-    results_dir = _make_output_dir(ticker)
+    # Result directories under ./reports/details/<date>/<company>_<ticker>/
+    results_dir = _make_output_dir(ticker, analysis_date)
     results_dir.mkdir(parents=True, exist_ok=True)
     report_dir = results_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1473,12 +1513,16 @@ def _run_headless(
     out = Path(save_dir) if save_dir else results_dir
 
     try:
-        md_file = save_report_to_disk(final_state, ticker, out)
+        md_file = save_report_to_disk(final_state, ticker, out,
+                                      analysis_date=analysis_date)
         print(f"\nReport saved to: {out.resolve()}")
         print(f"  Markdown: {md_file.name}")
         html = md_file.with_suffix(".html")
         if html.exists():
             print(f"  HTML:     {html.name}")
+        htmls_dir = _report_htmls_dir()
+        if htmls_dir.exists():
+            print(f"  Quick access: {htmls_dir.resolve()}")
     except Exception as e:
         print(f"Error saving report: {e}")
 
