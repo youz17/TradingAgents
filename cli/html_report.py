@@ -22,7 +22,7 @@ def _md_to_html(md_text: str) -> str:
         import markdown
         return markdown.markdown(
             md_text,
-            extensions=["tables", "fenced_code", "nl2br", "sane_lists"],
+            extensions=["tables", "fenced_code", "nl2br", "sane_lists", "md_in_html"],
         )
     except ImportError:
         return _simple_md_to_html(md_text)
@@ -49,7 +49,7 @@ def _simple_md_to_html(text: str) -> str:
 
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -88,7 +88,12 @@ body {{
   border-right: 1px solid var(--border);
   padding: 24px 16px;
   z-index: 100;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }}
+.sidebar::-webkit-scrollbar {{ width: 6px; }}
+.sidebar::-webkit-scrollbar-track {{ background: transparent; }}
+.sidebar::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
 .sidebar h2 {{
   font-size: 14px;
   text-transform: uppercase;
@@ -163,6 +168,10 @@ body {{
   margin: 20px 0 10px;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--border);
+  scroll-margin-top: 24px;
+}}
+[id^="section-"] {{
+  scroll-margin-top: 24px;
 }}
 .section-body h4 {{ font-size: 14px; color: var(--yellow); margin: 16px 0 8px; }}
 .section-body p  {{ margin: 8px 0; color: var(--text); }}
@@ -222,6 +231,12 @@ body {{
   .sidebar {{ display: none; }}
   .main {{ margin-left: 0; padding: 20px; }}
 }}
+@media print {{
+  .sidebar, .back-top {{ display: none !important; }}
+  .main {{ margin-left: 0; padding: 0; max-width: none; }}
+  .section {{ break-inside: avoid; }}
+  .section.collapsed .section-body {{ display: block !important; }}
+}}
 </style>
 </head>
 <body>
@@ -244,15 +259,52 @@ body {{
 document.querySelectorAll('.section-header').forEach(h => {{
   h.addEventListener('click', () => h.parentElement.classList.toggle('collapsed'));
 }});
-// Scroll spy for sidebar
+
+// Auto-expand collapsed parent when clicking a sidebar link
+document.querySelectorAll('.sidebar a').forEach(a => {{
+  a.addEventListener('click', e => {{
+    const id = a.getAttribute('href')?.slice(1);
+    if (!id) return;
+    const target = document.getElementById(id);
+    if (!target) return;
+    const section = target.closest('.section');
+    if (section && section.classList.contains('collapsed')) {{
+      section.classList.remove('collapsed');
+    }}
+  }});
+}});
+
+// Scroll spy – tracks both H2 sections and H3 anchors
 const links = document.querySelectorAll('.sidebar a');
-const sections = document.querySelectorAll('.section[id]');
 const backTop = document.querySelector('.back-top');
+const sidebar = document.querySelector('.sidebar');
+
+function getVisibleAnchors() {{
+  return Array.from(document.querySelectorAll('[id^="section-"]'))
+    .filter(el => el.offsetParent !== null);
+}}
+
+let spyTimer;
 window.addEventListener('scroll', () => {{
   backTop.classList.toggle('visible', window.scrollY > 400);
-  let current = '';
-  sections.forEach(s => {{ if (window.scrollY >= s.offsetTop - 100) current = s.id; }});
-  links.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + current));
+  clearTimeout(spyTimer);
+  spyTimer = setTimeout(() => {{
+    let current = '';
+    getVisibleAnchors().forEach(el => {{
+      if (window.scrollY >= el.offsetTop - 120) current = el.id;
+    }});
+    links.forEach(a => {{
+      const isActive = a.getAttribute('href') === '#' + current;
+      a.classList.toggle('active', isActive);
+      if (isActive) {{
+        const rect = a.getBoundingClientRect();
+        const sRect = sidebar.getBoundingClientRect();
+        if (rect.top < sRect.top + 60 || rect.bottom > sRect.bottom - 20) {{
+          a.scrollIntoView({{ block: 'center', behavior: 'smooth' }});
+        }}
+      }}
+    }});
+  }}, 50);
 }});
 </script>
 </body>
@@ -293,16 +345,29 @@ def generate_html_report(md_path: Path, out_path: Path | None = None) -> Path:
         heading = heading_match.group(1) if heading_match else f"Section {idx+1}"
         sec_id = f"section-{idx}"
 
-        toc_lines.append(f'<a href="#{sec_id}">{heading}</a>')
+        toc_lines.append(f'<a href="#{sec_id}">{html.escape(heading)}</a>')
 
-        # Find H3 subsections for nested TOC
+        # Find H3 subsections — give each a unique anchor
+        sub_idx = 0
         for sub_match in re.finditer(r"^### (.+)$", sec, re.MULTILINE):
             sub_name = sub_match.group(1)
-            toc_lines.append(f'<a href="#{sec_id}" class="sub">{sub_name}</a>')
+            sub_id = f"section-{idx}-{sub_idx}"
+            toc_lines.append(f'<a href="#{sub_id}" class="sub">{html.escape(sub_name)}</a>')
+            sub_idx += 1
 
-        # Convert section body (everything after the H2 line) to HTML
+        # Inject anchor IDs into H3 tags before converting to HTML
         sec_body = re.sub(r"^## .+$", "", sec, count=1, flags=re.MULTILINE).strip()
-        sec_html = _md_to_html(sec_body)
+
+        _sub_counter = [0]
+        def _inject_h3_anchor(m, _idx=idx):
+            sub_id = f"section-{_idx}-{_sub_counter[0]}"
+            _sub_counter[0] += 1
+            return f'<h3 id="{sub_id}">{html.escape(m.group(1))}</h3>'
+
+        # Replace ### headings with anchored <h3> BEFORE markdown conversion
+        # so the markdown converter doesn't double-wrap them
+        sec_body_with_anchors = re.sub(r"^### (.+)$", _inject_h3_anchor, sec_body, flags=re.MULTILINE)
+        sec_html = _md_to_html(sec_body_with_anchors)
 
         body_parts.append(
             f'<div class="section" id="{sec_id}">'

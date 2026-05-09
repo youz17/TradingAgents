@@ -1,5 +1,6 @@
 from typing import Optional
 import datetime
+import logging
 import typer
 from pathlib import Path
 from functools import wraps
@@ -9,6 +10,34 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 load_dotenv(".env.enterprise", override=False)
+
+
+def _setup_logging(log_file: Path | None = None):
+    """Configure stdlib logging with a file handler for diagnostics.
+
+    Log levels:
+    - File: DEBUG (captures everything including timing data)
+    - Console: WARNING only (don't pollute the Rich UI)
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.live import Live
@@ -636,6 +665,32 @@ def get_analysis_date():
             )
 
 
+def _fetch_company_name(ticker: str) -> str:
+    """Best-effort lookup of the company short name via AKShare (A-share only)."""
+    try:
+        from tradingagents.dataflows.akshare_common import detect_market, normalize_symbol_cn
+        if detect_market(ticker) != "cn":
+            return ""
+        import akshare as ak
+        symbol = normalize_symbol_cn(ticker)
+        df = ak.stock_individual_info_em(symbol=symbol)
+        name = df.loc[df["item"] == "股票简称", "value"].iloc[0]
+        return str(name).strip()
+    except Exception:
+        return ""
+
+
+def _make_output_dir(ticker: str, base: Path | None = None) -> Path:
+    """Build ``./reports/{ticker}_{company_name}/`` under *base* (default: cwd).
+
+    Falls back to ``{ticker}`` if the company name cannot be resolved.
+    """
+    company = _fetch_company_name(ticker)
+    folder = f"{ticker}_{company}" if company else ticker
+    folder = folder.replace("/", "_").replace("\\", "_")
+    return (base or Path.cwd()) / "reports" / folder
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
     """Save complete analysis report to disk with organized subfolders."""
     save_path.mkdir(parents=True, exist_ok=True)
@@ -975,13 +1030,16 @@ def run_analysis(checkpoint: bool = False):
     # Track start time for elapsed display
     start_time = time.time()
 
-    # Create result directory
-    results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
+    # Create result directory under ./reports/{ticker}_{company}/
+    results_dir = _make_output_dir(selections["ticker"])
     results_dir.mkdir(parents=True, exist_ok=True)
     report_dir = results_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     log_file = results_dir / "message_tool.log"
     log_file.touch(exist_ok=True)
+
+    # Set up diagnostic logging (detailed timing goes to debug.log)
+    _setup_logging(results_dir / "debug.log")
 
     def save_message_decorator(obj, func_name):
         func = getattr(obj, func_name)
@@ -1198,14 +1256,24 @@ def run_analysis(checkpoint: bool = False):
         live_writer.sync_from_buffer(message_buffer)
         live_writer.finish()
 
+    # Log final statistics summary
+    _logger = logging.getLogger(__name__)
+    try:
+        from tradingagents.dataflows.interface import get_call_stats_summary
+        stats_summary = get_call_stats_summary()
+        _logger.info("\n%s", stats_summary)
+    except Exception:
+        pass
+    elapsed_total = time.time() - start_time
+    _logger.info("Total analysis time: %.1fs", elapsed_total)
+
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
 
     # Prompt to save report
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
     if save_choice in ("Y", "YES", ""):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
+        default_path = _make_output_dir(selections["ticker"])
         save_path_str = typer.prompt(
             "Save path (press Enter for default)",
             default=str(default_path)
@@ -1245,6 +1313,256 @@ def analyze(
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
+
+
+# ---------------------------------------------------------------------------
+#  Headless mode — no interactive UI, just print reports to stdout
+# ---------------------------------------------------------------------------
+
+def _run_headless(
+    ticker: str,
+    analysis_date: str,
+    provider: str,
+    backend_url: str | None,
+    deep_model: str,
+    quick_model: str,
+    analysts: list[str],
+    language: str,
+    depth: int,
+    checkpoint: bool,
+    save_dir: str | None,
+):
+    """Run full analysis with plain-text output, no Rich Live UI."""
+    config = DEFAULT_CONFIG.copy()
+    config["max_debate_rounds"] = depth
+    config["max_risk_discuss_rounds"] = depth
+    config["quick_think_llm"] = quick_model
+    config["deep_think_llm"] = deep_model
+    config["backend_url"] = backend_url
+    config["llm_provider"] = provider
+    config["output_language"] = language
+    config["checkpoint_enabled"] = checkpoint
+
+    stats_handler = StatsCallbackHandler()
+    selected_analyst_keys = [a for a in ANALYST_ORDER if a in analysts]
+
+    graph = TradingAgentsGraph(
+        selected_analyst_keys,
+        config=config,
+        debug=True,
+        callbacks=[stats_handler],
+    )
+
+    # Result directories under ./reports/{ticker}_{company}/
+    results_dir = _make_output_dir(ticker)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = results_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    _setup_logging(results_dir / "debug.log")
+    _logger = logging.getLogger(__name__)
+
+    # --- Print banner ---
+    print("=" * 60)
+    print(f"  TradingAgents Headless Mode")
+    print(f"  Ticker:   {ticker}")
+    print(f"  Date:     {analysis_date}")
+    print(f"  Provider: {provider} ({deep_model} / {quick_model})")
+    print(f"  Analysts: {', '.join(selected_analyst_keys)}")
+    print(f"  Language: {language}")
+    print(f"  Depth:    {depth}")
+    print("=" * 60)
+    print()
+
+    start_time = time.time()
+
+    init_agent_state = graph.propagator.create_initial_state(ticker, analysis_date)
+    args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+
+    # Section labels for intermediate output
+    _section_labels = {
+        "market_report": "I. Market Analyst Report",
+        "sentiment_report": "II. Social Sentiment Report",
+        "news_report": "III. News Analyst Report",
+        "fundamentals_report": "IV. Fundamentals Analyst Report",
+    }
+    _printed_sections: set[str] = set()
+
+    def _print_section(title: str, content: str):
+        print()
+        print("─" * 60)
+        print(f"  {title}")
+        print("─" * 60)
+        print(content)
+        print()
+
+    trace = []
+    for chunk in graph.graph.stream(init_agent_state, **args):
+        # Print analyst reports as they arrive
+        for key, label in _section_labels.items():
+            if key not in _printed_sections and chunk.get(key):
+                _printed_sections.add(key)
+                _print_section(label, chunk[key])
+                # Save intermediate report
+                with open(report_dir / f"{key}.md", "w", encoding="utf-8") as f:
+                    f.write(chunk[key])
+
+        # Research debate
+        if chunk.get("investment_debate_state"):
+            ds = chunk["investment_debate_state"]
+            if ds.get("bull_history") and "bull" not in _printed_sections:
+                _printed_sections.add("bull")
+                _print_section("V-a. Bull Researcher", ds["bull_history"])
+            if ds.get("bear_history") and "bear" not in _printed_sections:
+                _printed_sections.add("bear")
+                _print_section("V-b. Bear Researcher", ds["bear_history"])
+            if ds.get("judge_decision") and "research_mgr" not in _printed_sections:
+                _printed_sections.add("research_mgr")
+                _print_section("V-c. Research Manager Decision", ds["judge_decision"])
+
+        # Trader
+        if chunk.get("trader_investment_plan") and "trader" not in _printed_sections:
+            _printed_sections.add("trader")
+            _print_section("VI. Trader Investment Plan", chunk["trader_investment_plan"])
+
+        # Risk debate
+        if chunk.get("risk_debate_state"):
+            rs = chunk["risk_debate_state"]
+            if rs.get("aggressive_history") and "aggressive" not in _printed_sections:
+                _printed_sections.add("aggressive")
+                _print_section("VII-a. Aggressive Analyst", rs["aggressive_history"])
+            if rs.get("conservative_history") and "conservative" not in _printed_sections:
+                _printed_sections.add("conservative")
+                _print_section("VII-b. Conservative Analyst", rs["conservative_history"])
+            if rs.get("neutral_history") and "neutral" not in _printed_sections:
+                _printed_sections.add("neutral")
+                _print_section("VII-c. Neutral Analyst", rs["neutral_history"])
+            if rs.get("judge_decision") and "portfolio_mgr" not in _printed_sections:
+                _printed_sections.add("portfolio_mgr")
+                _print_section("VIII. Portfolio Manager Decision", rs["judge_decision"])
+
+        trace.append(chunk)
+
+    final_state = trace[-1]
+    raw_decision = final_state.get("final_trade_decision", "")
+    decision = graph.process_signal(raw_decision)
+
+    elapsed = time.time() - start_time
+
+    print()
+    print("=" * 60)
+    print("  FINAL DECISION")
+    print("=" * 60)
+    print(f"  Rating: {decision}")
+    print(f"  Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s")
+    print("=" * 60)
+    if raw_decision:
+        print()
+        _print_section("IX. Final Trade Decision (raw)", raw_decision)
+
+    # Log stats
+    try:
+        from tradingagents.dataflows.interface import get_call_stats_summary
+        summary = get_call_stats_summary()
+        _logger.info("\n%s", summary)
+        print(f"\n{summary}")
+    except Exception:
+        pass
+
+    # Save final report into the same output directory
+    out = Path(save_dir) if save_dir else results_dir
+
+    try:
+        md_file = save_report_to_disk(final_state, ticker, out)
+        print(f"\nReport saved to: {out.resolve()}")
+        print(f"  Markdown: {md_file.name}")
+        html = md_file.with_suffix(".html")
+        if html.exists():
+            print(f"  HTML:     {html.name}")
+    except Exception as e:
+        print(f"Error saving report: {e}")
+
+    print(f"\nDebug log: {results_dir / 'debug.log'}")
+
+
+@app.command()
+def run(
+    ticker: str = typer.Argument(..., help="Stock ticker symbol, e.g. 600519, AAPL, 00700.HK"),
+    date: str = typer.Option(
+        None, "--date", "-d",
+        help="Analysis date (YYYY-MM-DD). Defaults to today.",
+    ),
+    provider: str = typer.Option(
+        "deepseek", "--provider", "-p",
+        help="LLM provider: deepseek, openai, google, anthropic, qwen, glm, etc.",
+    ),
+    deep_model: str = typer.Option(
+        "deepseek-v4-pro", "--deep-model",
+        help="Deep-thinking model name.",
+    ),
+    quick_model: str = typer.Option(
+        "deepseek-v4-flash", "--quick-model",
+        help="Quick-thinking model name.",
+    ),
+    language: str = typer.Option(
+        "Chinese", "--lang", "-l",
+        help="Output language for reports.",
+    ),
+    depth: int = typer.Option(
+        3, "--depth",
+        help="Debate depth (1=shallow, 2=medium, 3=deep).",
+    ),
+    analysts: str = typer.Option(
+        "market,social,news,fundamentals", "--analysts", "-a",
+        help="Comma-separated analyst list.",
+    ),
+    save_dir: str = typer.Option(
+        None, "--save-dir", "-o",
+        help="Custom output directory for reports.",
+    ),
+    checkpoint: bool = typer.Option(
+        False, "--checkpoint",
+        help="Enable checkpoint/resume.",
+    ),
+):
+    """Run analysis in headless mode — no UI, just stream reports to stdout.
+
+    \b
+    Examples:
+      python -m cli.main run 600519
+      python -m cli.main run AAPL --lang English --provider openai --deep-model gpt-5.4
+      python -m cli.main run 00700.HK --depth 2 --analysts market,fundamentals
+    """
+    if date is None:
+        date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # Resolve provider backend URL
+    _provider_urls = {
+        "openai": "https://api.openai.com/v1",
+        "deepseek": "https://api.deepseek.com",
+        "xai": "https://api.x.ai/v1",
+        "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "glm": "https://open.bigmodel.cn/api/paas/v4/",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "ollama": "http://localhost:11434/v1",
+    }
+    backend_url = _provider_urls.get(provider.lower())
+
+    analyst_list = [a.strip() for a in analysts.split(",") if a.strip()]
+
+    _run_headless(
+        ticker=ticker,
+        analysis_date=date,
+        provider=provider.lower(),
+        backend_url=backend_url,
+        deep_model=deep_model,
+        quick_model=quick_model,
+        analysts=analyst_list,
+        language=language,
+        depth=depth,
+        checkpoint=checkpoint,
+        save_dir=save_dir,
+    )
 
 
 if __name__ == "__main__":
