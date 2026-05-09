@@ -60,10 +60,13 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
        fails with HTTP 400. ``_create_chat_result`` captures the field on
        receive and ``_get_request_payload`` re-attaches it on send.
 
-    2. **deepseek-reasoner has no tool_choice.** Structured output via
-       function-calling is unavailable, so we raise NotImplementedError
-       and let the agent factories fall back to free-text generation
-       (see ``tradingagents/agents/utils/structured.py``).
+    2. **tool_choice handling.** ``deepseek-reasoner`` has no structured output
+       at all (raises ``NotImplementedError``).  All other DeepSeek models
+       support tool calls (``tools`` param) but reject forced ``tool_choice``
+       (i.e. ``{"type": "function", "function": {...}}``); only ``"auto"``,
+       ``"none"``, and ``"required"`` are accepted.  ``bind_tools`` downgrades
+       any forced choice to ``"auto"`` so the model still sees the tool
+       definition and almost always calls it voluntarily.
     """
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
@@ -94,12 +97,20 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
                 generation.message.additional_kwargs["reasoning_content"] = reasoning
         return chat_result
 
+    _NO_STRUCTURED_MODELS = {"deepseek-reasoner"}
+
+    _ALLOWED_TOOL_CHOICES = {None, "auto", "none", "any", "required"}
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        if tool_choice not in self._ALLOWED_TOOL_CHOICES:
+            tool_choice = "auto"
+        return super().bind_tools(tools, tool_choice=tool_choice, **kwargs)
+
     def with_structured_output(self, schema, *, method=None, **kwargs):
-        if self.model_name == "deepseek-reasoner":
+        if self.model_name in self._NO_STRUCTURED_MODELS or "reasoner" in self.model_name:
             raise NotImplementedError(
-                "deepseek-reasoner does not support tool_choice; structured "
-                "output is unavailable. Agent factories fall back to "
-                "free-text generation automatically."
+                f"{self.model_name} does not support structured output; "
+                "agent factories fall back to free-text generation automatically."
             )
         return super().with_structured_output(schema, method=method, **kwargs)
 
