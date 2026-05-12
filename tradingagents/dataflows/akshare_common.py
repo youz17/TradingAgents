@@ -66,6 +66,7 @@ _KNOWN_NYSE = {
 }
 
 _A_SHARE_RE = re.compile(r"^\d{6}$")
+_HK_RE = re.compile(r"^(?:HK[.\s]?\d{4,5}|\d{4,5}[.\s]?HK|0\d{4})$", re.IGNORECASE)
 
 
 class AkShareError(Exception):
@@ -74,11 +75,15 @@ class AkShareError(Exception):
 
 
 def detect_market(symbol: str) -> str:
-    """Return ``'cn'``, ``'us'``, or ``'hk'`` based on the symbol pattern."""
+    """Return ``'cn'``, ``'us'``, or ``'hk'`` based on the symbol pattern.
+
+    Recognised HK formats: ``HK00700``, ``HK.00700``, ``00700.HK``,
+    ``0700.HK``, ``00700`` (5-digit zero-padded).
+    """
     s = symbol.strip()
     if _A_SHARE_RE.match(s):
         return "cn"
-    if s.upper().endswith(".HK") or s.upper().startswith("HK."):
+    if _HK_RE.match(s):
         return "hk"
     return "us"
 
@@ -107,9 +112,14 @@ def normalize_symbol_us(symbol: str) -> str:
 
 
 def normalize_symbol_hk(symbol: str) -> str:
-    """Normalise HK ticker to a 5-digit code string (e.g. ``00700``)."""
+    """Normalise HK ticker to a 5-digit code string (e.g. ``00700``).
+
+    Handles: ``HK00700``, ``HK.00700``, ``00700.HK``, ``0700``, ``00700``.
+    """
     s = symbol.strip().upper()
     s = s.replace("HK.", "").replace(".HK", "")
+    s = re.sub(r"^HK", "", s)
+    s = re.sub(r"[^\d]", "", s)
     return s.zfill(5)
 
 
@@ -126,6 +136,59 @@ def _cache_path(symbol: str, start: str, end: str) -> str:
         config["data_cache_dir"],
         f"{safe_symbol}-AKShare-data-{start}-{end}.csv",
     )
+
+
+def _fetch_hk_ohlcv(symbol: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """Fetch HK stock OHLCV: Sina (``stock_hk_daily``) first, East Money fallback.
+
+    ``stock_hk_daily`` returns the full history and needs client-side date
+    filtering.  ``stock_hk_hist`` accepts date params but is often offline.
+    """
+    import akshare as ak
+
+    code = normalize_symbol_hk(symbol)
+
+    def _try_sina():
+        raw = akshare_retry(ak.stock_hk_daily, symbol=code, adjust="qfq")
+        data = _normalise_cn_columns(raw)
+        if data.empty:
+            raise AkShareError("Sina HK returned empty data")
+        data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+        start_dt, end_dt = pd.Timestamp(start_str), pd.Timestamp(end_str)
+        return data[(data["Date"] >= start_dt) & (data["Date"] <= end_dt)]
+
+    def _try_eastmoney():
+        raw = akshare_retry(
+            ak.stock_hk_hist,
+            symbol=code, period="daily",
+            start_date=akshare_date(start_str),
+            end_date=akshare_date(end_str),
+            adjust="qfq",
+        )
+        data = _normalise_cn_columns(raw)
+        if data.empty:
+            raise AkShareError("EastMoney HK returned empty data")
+        return data
+
+    sources = [
+        ("Sina", _try_sina),
+        ("EastMoney", _try_eastmoney),
+        ("Sina", _try_sina),
+    ]
+
+    last_exc = None
+    for name, fetch_fn in sources:
+        try:
+            data = fetch_fn()
+            if not data.empty:
+                logger.info("[AKSHARE] HK OHLCV OK via %s for %s", name, symbol)
+                return data
+        except Exception as e:
+            last_exc = e
+            logger.warning("[AKSHARE] HK %s failed for %s: %s", name, symbol, e)
+            _time.sleep(2)
+
+    raise AkShareError(f"All HK OHLCV sources failed for {symbol}: {last_exc}")
 
 
 def _fetch_cn_ohlcv(symbol: str, start_str: str, end_str: str) -> pd.DataFrame:
@@ -216,15 +279,7 @@ def load_ohlcv_akshare(symbol: str, curr_date: str) -> pd.DataFrame:
             if market == "cn":
                 data = _fetch_cn_ohlcv(symbol, start_str, end_str)
             elif market == "hk":
-                raw = akshare_retry(
-                    ak.stock_hk_hist,
-                    symbol=normalize_symbol_hk(symbol),
-                    period="daily",
-                    start_date=akshare_date(start_str),
-                    end_date=akshare_date(end_str),
-                    adjust="qfq",
-                )
-                data = _normalise_cn_columns(raw)
+                data = _fetch_hk_ohlcv(symbol, start_str, end_str)
             else:
                 raw = akshare_retry(
                     ak.stock_us_hist,

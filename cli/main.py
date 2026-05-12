@@ -666,16 +666,22 @@ def get_analysis_date():
 
 
 def _fetch_company_name(ticker: str) -> str:
-    """Best-effort lookup of the company short name via AKShare (A-share only)."""
+    """Best-effort lookup of the company short name via AKShare (A-share + HK)."""
     try:
-        from tradingagents.dataflows.akshare_common import detect_market, normalize_symbol_cn
-        if detect_market(ticker) != "cn":
-            return ""
+        from tradingagents.dataflows.akshare_common import detect_market, normalize_symbol_cn, normalize_symbol_hk
         import akshare as ak
-        symbol = normalize_symbol_cn(ticker)
-        df = ak.stock_individual_info_em(symbol=symbol)
-        name = df.loc[df["item"] == "股票简称", "value"].iloc[0]
-        return str(name).strip()
+        market = detect_market(ticker)
+        if market == "cn":
+            symbol = normalize_symbol_cn(ticker)
+            df = ak.stock_individual_info_em(symbol=symbol)
+            name = df.loc[df["item"] == "股票简称", "value"].iloc[0]
+            return str(name).strip()
+        if market == "hk":
+            code = normalize_symbol_hk(ticker)
+            df = ak.stock_financial_hk_report_em(stock=code, symbol="利润表")
+            if df is not None and not df.empty and "SECURITY_NAME_ABBR" in df.columns:
+                return str(df["SECURITY_NAME_ABBR"].iloc[0]).strip()
+        return ""
     except Exception:
         return ""
 
@@ -812,11 +818,11 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path,
         pass
 
     # Copy the HTML report to reports/report_htmls/<company>_<code>_<date>.html
+    # Reuse the folder name from save_path (already contains company name)
     if html_path.exists():
         if analysis_date is None:
             analysis_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        company = _fetch_company_name(ticker)
-        stem = _safe_folder_name(ticker, company)
+        stem = save_path.name
         dest_dir = _report_htmls_dir()
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_file = dest_dir / f"{stem}_{analysis_date}.html"

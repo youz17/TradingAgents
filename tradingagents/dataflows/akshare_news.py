@@ -8,7 +8,7 @@ from typing import Annotated
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 
-from .akshare_common import AkShareError, akshare_retry, detect_market, normalize_symbol_cn
+from .akshare_common import AkShareError, akshare_retry, detect_market, normalize_symbol_cn, normalize_symbol_hk
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +25,16 @@ def get_news(
     import akshare as ak
 
     market = detect_market(ticker)
-    if market != "cn":
+    if market == "hk":
+        symbol = normalize_symbol_hk(ticker)
+    elif market == "cn":
+        symbol = normalize_symbol_cn(ticker)
+    else:
         return (
-            f"AKShare stock news is primarily available for Chinese A-share stocks. "
+            f"AKShare stock news is available for Chinese A-share and HK stocks. "
             f"Symbol '{ticker}' appears to be a {market.upper()} ticker. "
             f"Consider using yfinance or alpha_vantage for news on this symbol."
         )
-
-    symbol = normalize_symbol_cn(ticker)
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 

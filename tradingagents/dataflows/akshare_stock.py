@@ -16,6 +16,7 @@ from .akshare_common import (
     normalize_symbol_hk,
     akshare_date,
     _fetch_cn_ohlcv,
+    _fetch_hk_ohlcv,
     _normalise_cn_columns,
 )
 
@@ -43,15 +44,7 @@ def get_stock(
         if market == "cn":
             data = _fetch_cn_ohlcv(symbol, start_date, end_date)
         elif market == "hk":
-            raw = akshare_retry(
-                ak.stock_hk_hist,
-                symbol=normalize_symbol_hk(symbol),
-                period="daily",
-                start_date=akshare_date(start_date),
-                end_date=akshare_date(end_date),
-                adjust="qfq",
-            )
-            data = _normalise_cn_columns(raw)
+            data = _fetch_hk_ohlcv(symbol, start_date, end_date)
         else:
             raw = akshare_retry(
                 ak.stock_us_hist,
